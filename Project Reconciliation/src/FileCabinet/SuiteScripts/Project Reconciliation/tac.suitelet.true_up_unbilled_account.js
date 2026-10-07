@@ -32,7 +32,16 @@ function(ui, search, record, log, runtime, url, format) {
 	var SUITELET_URL;
 	var BACK_BUTTON_HTML;
 
-    function onRequest(context) {
+	function getNumericFilterValue(value) {
+		if (value === null || value === undefined) {
+			return '';
+		}
+
+		var normalizedValue = String(value).trim();
+		return /^\d+$/.test(normalizedValue) ? normalizedValue : '';
+	}
+
+	function onRequest(context) {
         try {
 			var currentScript = runtime.getCurrentScript();
             DEFERRED_REVENUE_ACCOUNT_ID = currentScript.getParameter({name: 'custscript_tac_deferred_rev_acct'});
@@ -46,8 +55,8 @@ function(ui, search, record, log, runtime, url, format) {
             BACK_BUTTON_HTML = '<div style="margin-top:10px;"><a href="' + SUITELET_URL + '" style="display:inline-block;padding:6px 12px;background:#0070d2;color:#fff;text-decoration:none;border-radius:4px;">Back</a></div>';
 
             // GET: Display form for project selection
-			let projectId = context.request.parameters.projectId;
-			let filterCustomerId = context.request.parameters.filterCustomerId;
+			let projectId = getNumericFilterValue(context.request.parameters.projectId);
+			let filterCustomerId = getNumericFilterValue(context.request.parameters.filterCustomerId);
 			var formatter = new Intl.NumberFormat('en-US', {
                     style: 'currency',
                     currency: 'USD',
@@ -255,10 +264,17 @@ function(ui, search, record, log, runtime, url, format) {
                 var totalNetAll = 0;
                 var totalRemainingAll = 0;
 
+				// Fetch totals for all selected projects up front (one run per search)
+				// instead of per project, to stay within the governance limit
+				var selectedIds = selectedProjects.map(function(p) { return p.internalId; });
+				var unbilledTotals = getUnbilledTotalsByProject(selectedIds);
+				var deferredTotals = getDeferredTotalsByProject(selectedIds);
+
                 selectedProjects.forEach(function(project) {
-					var totalUnbilledAmount = calculateTotalNetAmount(project.internalId);
-                    var totalCreditAmount = getUnbilledCreditTotal(project.internalId);
-                    var totalDeferredAmount = getDeferredTotalAmount(project.internalId) - totalCreditAmount;
+					var unbilled = unbilledTotals[project.internalId] || { debit: 0, credit: 0 };
+					var totalUnbilledAmount = unbilled.debit - unbilled.credit;
+                    var totalCreditAmount = unbilled.credit;
+                    var totalDeferredAmount = (deferredTotals[project.internalId] || 0) - totalCreditAmount;
 
                     // Net amount to true up is the deferred balance net of what's already
                     // been credited against it.
@@ -376,74 +392,11 @@ function(ui, search, record, log, runtime, url, format) {
 	 */
 	function getActiveProjectsWithUnbilled(filterProjectId, filterCustomerId) {
 		try {
-			// Step 1: Sum debit amounts from search 1, grouped by entity
-			var debitSearch = search.load({ id: 'customsearch_tac_get_unbilled_je' });
-			var entityAmounts = {};
-
-			if (filterProjectId) {
-				debitSearch.filters.push(search.createFilter({
-					name: 'internalid',
-					join: 'job',
-					operator: 'is',
-					values: filterProjectId
-				}));
-			}
-
-			debitSearch.run().each(function(result) {
-				log.debug({
-					title: 'result in debit search',
-					details: result
-				});
-				var entityId = result.getValue({ name: 'formulatext', summary: 'GROUP', formula: 'TO_CHAR({entity.id})' });
-				var entityName = result.getText({ name: 'entity', summary: 'GROUP' });
-				var amount = parseFloat(result.getValue({ name: 'debitamount', summary: 'SUM' })) || 0;
-
-				if (entityId) {
-					if (!entityAmounts[entityId]) {
-						entityAmounts[entityId] = { id: entityId, name: entityName, debit: 0, credit: 0 };
-					}
-					entityAmounts[entityId].debit += amount;
-				}
-				return true;
-			});
+			// Steps 1-2: Sum debit and credit amounts, grouped by entity
+			var entityAmounts = getUnbilledTotalsByProject(filterProjectId ? [filterProjectId] : null);
 
 			log.debug({
 				title: 'entityAmounts',
-				details: entityAmounts
-			})
-
-			// Step 2: Sum credit amounts from search 2, grouped by entity
-			var creditSearch = search.load({ id: 'customsearch_tac_get_unbilled_je_2' });
-
-			if (filterProjectId) {
-				creditSearch.filters.push(search.createFilter({
-					name: 'internalid',
-					join: 'job',
-					operator: 'is',
-					values: filterProjectId
-				}));
-			}
-
-			creditSearch.run().each(function(result) {
-				log.debug({
-					title: 'result in credit search',
-					details: result
-				});
-				var entityId = result.getValue({ name: 'formulatext', summary: 'GROUP', formula: 'TO_CHAR({entity.id})' });
-				var entityName = result.getText({ name: 'entity', summary: 'GROUP' });
-				var amount = Math.abs(parseFloat(result.getValue({ name: 'amount', summary: 'SUM' })) || 0);
-
-				if (entityId) {
-					if (!entityAmounts[entityId]) {
-						entityAmounts[entityId] = { id: entityId, name: entityName, debit: 0, credit: 0 };
-					}
-					entityAmounts[entityId].credit += amount;
-				}
-				return true;
-			});
-
-			log.debug({
-				title: 'entityAmounts after credit search',
 				details: entityAmounts
 			})
 
@@ -479,25 +432,27 @@ function(ui, search, record, log, runtime, url, format) {
 			});
 
 			// Step 4: Filter to non-zero net amounts on active projects, fetch deferred amounts
-			var results = [];
-			Object.keys(entityAmounts).forEach(function(entityId) {
+			var candidateIds = Object.keys(entityAmounts).filter(function(entityId) {
 				var data = entityAmounts[entityId];
-				var netAmount = data.debit - data.credit;
+				return (data.debit - data.credit) !== 0 && activeProjectIds[entityId];
+			});
+			var deferredTotals = getDeferredTotalsByProject(candidateIds);
 
-				if (netAmount !== 0 && activeProjectIds[entityId]) {
-					var deferredAmount = getDeferredTotalAmount(data.id) - data.credit;
+			var results = [];
+			candidateIds.forEach(function(entityId) {
+				var data = entityAmounts[entityId];
+				var deferredAmount = (deferredTotals[entityId] || 0) - data.credit;
 
-					if (deferredAmount <= 0) {
-						return;
-					}
-
-					results.push({
-						id: data.id,
-						name: data.name,
-						deferredAmount: deferredAmount,
-						unbilledAmount: netAmount
-					});
+				if (deferredAmount <= 0) {
+					return;
 				}
+
+				results.push({
+					id: data.id,
+					name: data.name,
+					deferredAmount: deferredAmount,
+					unbilledAmount: data.debit - data.credit
+				});
 			});
 
 			return results;
@@ -508,7 +463,14 @@ function(ui, search, record, log, runtime, url, format) {
 		}
 	}
 
-	function getDeferredTotalAmount(projectId) {
+	/**
+	 * Returns deferred amount totals keyed by project internal ID, using a single
+	 * run of customsearch_tac_get_deferred_amount_2 for all given projects.
+	 */
+	function getDeferredTotalsByProject(projectIds) {
+		var totals = {};
+		if (!projectIds || projectIds.length === 0) return totals;
+
 		try {
 			var savedSearch = search.load({
 				id: 'customsearch_tac_get_deferred_amount_2'
@@ -517,111 +479,91 @@ function(ui, search, record, log, runtime, url, format) {
 			savedSearch.filters.push(search.createFilter({
 				name: 'internalid',
 				join: 'job',
-				operator: 'is',
-				values: projectId
+				operator: 'anyof',
+				values: projectIds
 			}));
 
-			var totalAmount = 0;
+			// Group by project so one run returns a total per project
+			var projectColumn = search.createColumn({name: 'internalid', join: 'job', summary: 'GROUP'});
+			savedSearch.columns = savedSearch.columns.concat([projectColumn]);
 
 			savedSearch.run().each(function(result) {
+				var projectId = result.getValue(projectColumn);
 				var amount = parseFloat(result.getValue({name: "amount", summary: "SUM"})) || 0;
-				totalAmount += amount;
+				if (projectId) {
+					totals[projectId] = (totals[projectId] || 0) + amount;
+				}
 				return true;
 			});
 
-			return totalAmount;
-
 		} catch (error) {
-			log.error('Error calculating deferred total amount:', error.message);
-			return 0;
+			log.error('Error calculating deferred totals:', error.message);
 		}
+
+		return totals;
 	}
 
-	function calculateTotalNetAmount(projectId) {
-		try {
-			var debitSearch = search.load({
-				id: 'customsearch_tac_get_unbilled_je'
-			});
+	/**
+	 * Returns { id, name, debit, credit } keyed by entity (project) internal ID.
+	 * Debits come from customsearch_tac_get_unbilled_je and credits from
+	 * customsearch_tac_get_unbilled_je_2. Pass projectIds to restrict to those projects.
+	 */
+	function getUnbilledTotalsByProject(projectIds) {
+		var totals = {};
 
-			debitSearch.filters.push(search.createFilter({
-				name: 'internalid',
-				join: 'job',
-				operator: 'is',
-				values: projectId
-			}));
+		accumulateUnbilledAmounts(totals, 'customsearch_tac_get_unbilled_je', projectIds, 'debit', function(result) {
+			return parseFloat(result.getValue({ name: 'debitamount', summary: 'SUM' })) || 0;
+		});
 
-			var creditSearch = search.load({
-				id: 'customsearch_tac_get_unbilled_je_2'
-			});
+		accumulateUnbilledAmounts(totals, 'customsearch_tac_get_unbilled_je_2', projectIds, 'credit', function(result) {
+			return Math.abs(parseFloat(result.getValue({ name: 'amount', summary: 'SUM' })) || 0);
+		});
 
-			creditSearch.filters.push(search.createFilter({
-				name: 'internalid',
-				join: 'job',
-				operator: 'is',
-				values: projectId
-			}));
-
-			var totalDebitAmount = 0;
-			var totalCreditAmount = 0;
-
-			debitSearch.run().each(function(result) {
-				var debitAmount = parseFloat(result.getValue({name: "debitamount", summary: "SUM"})) || 0;
-				totalDebitAmount += debitAmount;
-				return true;
-			});
-
-			creditSearch.run().each(function(result) {
-				var amount = Math.abs(parseFloat(result.getValue({name: "amount", summary: "SUM"})) || 0);
-				totalCreditAmount += amount;
-				return true;
-			});
-
-			return totalDebitAmount - totalCreditAmount;
-
-		} catch (error) {
-			log.error('Error calculating total net amount:', error.message);
-			return 0;
-		}
+		return totals;
 	}
 
-	function getUnbilledCreditTotal(projectId) {
-		try {
-			var creditSearch = search.load({
-				id: 'customsearch_tac_get_unbilled_je_2'
-			});
+	function accumulateUnbilledAmounts(totals, searchId, projectIds, amountKey, getAmount) {
+		var unbilledSearch = search.load({ id: searchId });
 
-			creditSearch.filters.push(search.createFilter({
+		if (projectIds && projectIds.length > 0) {
+			unbilledSearch.filters.push(search.createFilter({
 				name: 'internalid',
 				join: 'job',
-				operator: 'is',
-				values: projectId
+				operator: 'anyof',
+				values: projectIds
 			}));
-
-			var totalCreditAmount = 0;
-
-			creditSearch.run().each(function(result) {
-				var amount = Math.abs(parseFloat(result.getValue({name: "amount", summary: "SUM"})) || 0);
-				totalCreditAmount += amount;
-				return true;
-			});
-
-			return totalCreditAmount;
-
-		} catch (error) {
-			log.error('Error calculating unbilled credit total:', error.message);
-			return 0;
 		}
+
+		unbilledSearch.run().each(function(result) {
+			// Skip rows whose entity is not a numeric internal ID
+			var entityId = getNumericFilterValue(result.getValue({ name: 'formulatext', summary: 'GROUP', formula: 'TO_CHAR({entity.id})' }));
+
+			if (entityId) {
+				if (!totals[entityId]) {
+					totals[entityId] = {
+						id: entityId,
+						name: result.getText({ name: 'entity', summary: 'GROUP' }),
+						debit: 0,
+						credit: 0
+					};
+				}
+				totals[entityId][amountKey] += getAmount(result);
+			}
+			return true;
+		});
 	}
 
 	function createTrueUpJournalEntry(projectId, netAmount, tranDate) {
 		try {
-			var projectRecord = record.load({
-				type: 'job',
-				id: projectId
+			// lookupFields (1 unit) instead of record.load (5 units)
+			var projectFields = search.lookupFields({
+				type: search.Type.JOB,
+				id: projectId,
+				columns: ['entityid', 'subsidiary']
 			});
 
-			var projectName = projectRecord.getValue({fieldId: 'entityid'}) || 'Project ' + projectId;
-			var subsidiary = projectRecord.getValue({fieldId: 'subsidiary'});
+			var projectName = projectFields.entityid || 'Project ' + projectId;
+			var subsidiary = projectFields.subsidiary && projectFields.subsidiary.length ? projectFields.subsidiary[0].value : '';
 
 			// Get class and department from invoice
 			var department = '';
